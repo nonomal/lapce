@@ -2,201 +2,219 @@ use std::{
     borrow::Cow,
     collections::VecDeque,
     io::{self, ErrorKind, Read, Write},
+    num::NonZeroUsize,
     path::PathBuf,
-    sync::atomic::{self, AtomicU64},
+    sync::Arc,
+    time::Duration,
 };
 
 use alacritty_terminal::{
-    ansi,
-    config::Program,
-    event::OnResize,
+    event::{OnResize, WindowSize},
     event_loop::Msg,
-    term::SizeInfo,
-    tty::{self, setup_env, EventedPty, EventedReadWrite},
+    tty::{self, setup_env, EventedPty, EventedReadWrite, Options, Shell},
 };
+use anyhow::Result;
+use crossbeam_channel::{Receiver, Sender};
 use directories::BaseDirs;
-use lapce_rpc::terminal::TermId;
-#[cfg(not(windows))]
-use mio::unix::UnixReady;
-#[allow(deprecated)]
-use mio::{
-    channel::{channel, Receiver, Sender},
-    Events, PollOpt, Ready,
+use lapce_rpc::{
+    core::CoreRpcHandler,
+    terminal::{TermId, TerminalProfile},
 };
-use serde_json::json;
-
-use crate::dispatch::Dispatcher;
+use polling::PollMode;
 
 const READ_BUFFER_SIZE: usize = 0x10_0000;
 
-pub struct Counter(AtomicU64);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PTY_READ_WRITE_TOKEN: usize = 0;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PTY_CHILD_EVENT_TOKEN: usize = 1;
 
-impl Counter {
-    pub const fn new() -> Counter {
-        Counter(AtomicU64::new(1))
+#[cfg(target_os = "windows")]
+const PTY_READ_WRITE_TOKEN: usize = 2;
+#[cfg(target_os = "windows")]
+const PTY_CHILD_EVENT_TOKEN: usize = 1;
+
+pub struct TerminalSender {
+    tx: Sender<Msg>,
+    poller: Arc<polling::Poller>,
+}
+
+impl TerminalSender {
+    pub fn new(tx: Sender<Msg>, poller: Arc<polling::Poller>) -> Self {
+        Self { tx, poller }
     }
 
-    pub fn next(&self) -> u64 {
-        self.0.fetch_add(1, atomic::Ordering::Relaxed)
+    pub fn send(&self, msg: Msg) {
+        if let Err(err) = self.tx.send(msg) {
+            tracing::error!("{:?}", err);
+        }
+        if let Err(err) = self.poller.notify() {
+            tracing::error!("{:?}", err);
+        }
     }
 }
 
-pub type TermConfig = alacritty_terminal::config::Config;
-
 pub struct Terminal {
     term_id: TermId,
-    poll: mio::Poll,
-    pty: alacritty_terminal::tty::Pty,
-
-    #[allow(deprecated)]
+    pub(crate) poller: Arc<polling::Poller>,
+    pub(crate) pty: alacritty_terminal::tty::Pty,
     rx: Receiver<Msg>,
-
-    #[allow(deprecated)]
     pub tx: Sender<Msg>,
 }
 
 impl Terminal {
     pub fn new(
         term_id: TermId,
-        cwd: Option<PathBuf>,
-        shell: String,
+        profile: TerminalProfile,
         width: usize,
         height: usize,
-    ) -> Terminal {
-        let poll = mio::Poll::new().unwrap();
-        let mut config = TermConfig::default();
-        config.pty_config.working_directory =
-            cwd.or_else(|| BaseDirs::new().map(|d| PathBuf::from(d.home_dir())));
-        let shell = shell.trim();
-        if !shell.is_empty() {
-            let mut parts = shell.split(' ');
-            let program = parts.next().unwrap();
-            if let Ok(p) = which::which(program) {
-                config.pty_config.shell = Some(Program::WithArgs {
-                    program: p.to_str().unwrap().to_string(),
-                    args: parts.map(|p| p.to_string()).collect::<Vec<String>>(),
-                })
-            }
-        }
-        setup_env(&config);
+    ) -> Result<Terminal> {
+        let poll = polling::Poller::new()?.into();
+
+        let options = Options {
+            shell: Terminal::program(&profile),
+            working_directory: Terminal::workdir(&profile),
+            hold: false,
+            env: profile.environment.unwrap_or_default(),
+        };
+
+        setup_env();
 
         #[cfg(target_os = "macos")]
         set_locale_environment();
 
-        let size =
-            SizeInfo::new(width as f32, height as f32, 1.0, 1.0, 0.0, 0.0, true);
-        let pty =
-            alacritty_terminal::tty::new(&config.pty_config, &size, None).unwrap();
+        let size = WindowSize {
+            num_lines: height as u16,
+            num_cols: width as u16,
+            cell_width: 1,
+            cell_height: 1,
+        };
+        let pty = alacritty_terminal::tty::new(&options, size, 0)?;
 
-        #[allow(deprecated)]
-        let (tx, rx) = channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
 
-        Terminal {
+        Ok(Terminal {
             term_id,
-            poll,
+            poller: poll,
             pty,
             tx,
             rx,
-        }
+        })
     }
 
-    pub fn run(&mut self, dispatcher: Dispatcher) {
-        let mut tokens = (0..).map(Into::into);
-        let poll_opts = PollOpt::edge() | PollOpt::oneshot();
-
-        let channel_token = tokens.next().unwrap();
-        self.poll
-            .register(&self.rx, channel_token, Ready::readable(), poll_opts)
-            .unwrap();
-
-        self.pty
-            .register(&self.poll, &mut tokens, Ready::readable(), poll_opts)
-            .unwrap();
-
-        let mut buf = [0u8; READ_BUFFER_SIZE];
-        let mut events = Events::with_capacity(1024);
+    pub fn run(&mut self, core_rpc: CoreRpcHandler) {
         let mut state = State::default();
+        let mut buf = [0u8; READ_BUFFER_SIZE];
 
+        let poll_opts = PollMode::Level;
+        let mut interest = polling::Event::readable(0);
+
+        // Register TTY through EventedRW interface.
+        unsafe {
+            self.pty
+                .register(&self.poller, interest, poll_opts)
+                .unwrap();
+        }
+
+        let mut events =
+            polling::Events::with_capacity(NonZeroUsize::new(1024).unwrap());
+
+        let timeout = Some(Duration::from_secs(6));
+        let mut exit_code = None;
         'event_loop: loop {
-            let _ = self.poll.poll(&mut events, None);
-            for event in events.iter() {
-                match event.token() {
-                    token if token == channel_token => {
-                        if !self.channel_event(channel_token, &mut state) {
-                            break 'event_loop;
-                        }
-                    }
+            events.clear();
+            if let Err(err) = self.poller.wait(&mut events, timeout) {
+                match err.kind() {
+                    ErrorKind::Interrupted => continue,
+                    _ => panic!("EventLoop polling error: {err:?}"),
+                }
+            }
 
-                    token if token == self.pty.child_event_token() => {
-                        if let Some(tty::ChildEvent::Exited) =
+            // Handle channel events, if there are any.
+            if !self.drain_recv_channel(&mut state) {
+                break;
+            }
+
+            for event in events.iter() {
+                match event.key {
+                    PTY_CHILD_EVENT_TOKEN => {
+                        if let Some(tty::ChildEvent::Exited(exited_code)) =
                             self.pty.next_child_event()
                         {
-                            dispatcher.send_notification(
-                                "close_terminal",
-                                json!({
-                                    "term_id": self.term_id,
-                                }),
-                            );
+                            if let Err(err) = self.pty_read(&core_rpc, &mut buf) {
+                                tracing::error!("{:?}", err);
+                            }
+                            exit_code = exited_code;
                             break 'event_loop;
                         }
                     }
-                    token
-                        if token == self.pty.read_token()
-                            || token == self.pty.write_token() =>
-                    {
-                        #[cfg(unix)]
-                        if UnixReady::from(event.readiness()).is_hup() {
+
+                    PTY_READ_WRITE_TOKEN => {
+                        if event.is_interrupt() {
                             // Don't try to do I/O on a dead PTY.
                             continue;
                         }
 
-                        if event.readiness().is_readable() {
-                            match self.pty.reader().read(&mut buf) {
-                                Ok(n) => {
-                                    dispatcher.send_notification(
-                                        "update_terminal",
-                                        json!({
-                                            "term_id": self.term_id,
-                                            "content": base64::encode(&buf[..n]),
-                                        }),
-                                    );
+                        if event.readable {
+                            if let Err(err) = self.pty_read(&core_rpc, &mut buf) {
+                                // On Linux, a `read` on the master side of a PTY can fail
+                                // with `EIO` if the client side hangs up.  In that case,
+                                // just loop back round for the inevitable `Exited` event.
+                                // This sucks, but checking the process is either racy or
+                                // blocking.
+                                #[cfg(target_os = "linux")]
+                                if err.raw_os_error() == Some(libc::EIO) {
+                                    continue;
                                 }
-                                Err(_e) => (),
+
+                                tracing::error!(
+                                    "Error reading from PTY in event loop: {}",
+                                    err
+                                );
+                                break 'event_loop;
                             }
                         }
 
-                        if event.readiness().is_writable() {
-                            if let Err(_err) = self.pty_write(&mut state) {}
+                        if event.writable {
+                            if let Err(_err) = self.pty_write(&mut state) {
+                                // error!(
+                                //     "Error writing to PTY in event loop: {}",
+                                //     err
+                                // );
+                                break 'event_loop;
+                            }
                         }
                     }
-
                     _ => (),
                 }
             }
+
             // Register write interest if necessary.
-            let mut interest = Ready::readable();
-            if state.needs_write() {
-                interest.insert(Ready::writable());
+            let needs_write = state.needs_write();
+            if needs_write != interest.writable {
+                interest.writable = needs_write;
+
+                // Re-register with new interest.
+                self.pty
+                    .reregister(&self.poller, interest, poll_opts)
+                    .unwrap();
             }
-            // Reregister with new interest.
-            self.pty
-                .reregister(&self.poll, interest, poll_opts)
-                .unwrap();
         }
-        let _ = self.poll.deregister(&self.rx);
-        let _ = self.pty.deregister(&self.poll);
+        core_rpc.terminal_process_stopped(self.term_id, exit_code);
+        if let Err(err) = self.pty.deregister(&self.poller) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     /// Drain the channel.
     ///
     /// Returns `false` when a shutdown message was received.
     fn drain_recv_channel(&mut self, state: &mut State) -> bool {
-        #[allow(deprecated)]
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Input(input) => state.write_list.push_back(input),
                 Msg::Shutdown => return false,
-                Msg::Resize(size) => self.pty.on_resize(&size),
+                Msg::Resize(size) => self.pty.on_resize(size),
             }
         }
 
@@ -204,21 +222,26 @@ impl Terminal {
     }
 
     #[inline]
-    fn channel_event(&mut self, token: mio::Token, state: &mut State) -> bool {
-        if !self.drain_recv_channel(state) {
-            return false;
+    fn pty_read(
+        &mut self,
+        core_rpc: &CoreRpcHandler,
+        buf: &mut [u8],
+    ) -> io::Result<()> {
+        loop {
+            match self.pty.reader().read(buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    core_rpc.update_terminal(self.term_id, buf[..n].to_vec());
+                }
+                Err(err) => match err.kind() {
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock => {
+                        break;
+                    }
+                    _ => return Err(err),
+                },
+            }
         }
-
-        self.poll
-            .reregister(
-                &self.rx,
-                token,
-                Ready::readable(),
-                PollOpt::edge() | PollOpt::oneshot(),
-            )
-            .unwrap();
-
-        true
+        Ok(())
     }
 
     #[inline]
@@ -253,6 +276,35 @@ impl Terminal {
         }
 
         Ok(())
+    }
+
+    fn workdir(profile: &TerminalProfile) -> Option<PathBuf> {
+        if let Some(cwd) = &profile.workdir {
+            match cwd.to_file_path() {
+                Ok(cwd) => {
+                    if cwd.exists() {
+                        return Some(cwd);
+                    }
+                }
+                Err(err) => {
+                    tracing::error!("{:?}", err);
+                }
+            }
+        }
+
+        BaseDirs::new().map(|d| PathBuf::from(d.home_dir()))
+    }
+
+    fn program(profile: &TerminalProfile) -> Option<Shell> {
+        if let Some(command) = &profile.command {
+            if let Some(arguments) = &profile.arguments {
+                Some(Shell::new(command.to_owned(), arguments.to_owned()))
+            } else {
+                Some(Shell::new(command.to_owned(), Vec::new()))
+            }
+        } else {
+            None
+        }
     }
 }
 
@@ -290,9 +342,6 @@ impl Writing {
 pub struct State {
     write_list: VecDeque<Cow<'static, [u8]>>,
     writing: Option<Writing>,
-
-    #[allow(dead_code)]
-    parser: ansi::Processor,
 }
 
 impl State {
@@ -324,7 +373,7 @@ impl State {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(target_os = "macos")]
 fn set_locale_environment() {
     let locale = locale_config::Locale::global_default()
         .to_string()
